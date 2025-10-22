@@ -13,7 +13,6 @@ import multiprocessing as mp
 from datetime import datetime
 import threading
 import queue
-import ctypes
 from concurrent.futures import ThreadPoolExecutor
 import gc
 
@@ -288,8 +287,8 @@ class ProcessWorker:
 
 class BitcoinKeyScanner:
     def __init__(self, num_processes=None, batch_size=100000):
-        self.start_range = 2243124079363081476505
-        self.end_range = 2243124079363181476505
+        self.start_range = 2**70
+        self.end_range = 2**71
         self.batch_size = batch_size
         self.target_address = TARGET_ADDRESS
         
@@ -342,7 +341,7 @@ class BitcoinKeyScanner:
             )
             self.processes.append(p)
     
-def _process_worker(self, process_id, start_key, end_key, batch_size, target_address,
+    def _process_worker(self, process_id, start_key, end_key, batch_size, target_address,
                        result_queue, progress_queue, stop_event):
         """进程工作函数"""
         worker = ProcessWorker(process_id, start_key, end_key, batch_size, 
