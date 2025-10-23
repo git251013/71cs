@@ -197,13 +197,13 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         "1Bxk4CQdqL9p22JEtDfdXMsng1XacifUtE"
     }
     
-    # 设置多进程启动方法 [citation:1]
+    # 设置多进程启动方法 
     try:
         multiprocessing.set_start_method('fork', force=True)
     except RuntimeError:
         pass
     
-    # 使用Manager创建共享对象 [citation:6]
+    # 使用Manager创建共享对象 
     with Manager() as manager:
         # 创建共享列表和值
         shared_results = manager.list()
@@ -283,7 +283,7 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
                 print(f"{i}. 地址: {result['address']}")
                 print(f"   私钥(WIF): {result['private_key_wif']}")
                 print(f"   进程ID: {result['process_id']}")
-              print(f"   所在区间: {result['range']}")
+                print(f"   所在区间: {result['range']}")
                 print()
             
             # 保存最终结果
