@@ -6,20 +6,42 @@ import secrets
 import json
 import time
 import multiprocessing
+import subprocess
+import sys
 from typing import List, Tuple, Dict, Set
-from multiprocessing import Process, Manager, Queue, Value, Lock
+from multiprocessing import Process, Manager, Value, Lock
+
+# 自动安装必要的库
+def install_required_packages():
+    """自动安装必要的依赖库"""
+    required_packages = ['base58', 'ecdsa']
+    for package in required_packages:
+        try:
+            __import__(package)
+            print(f"✓ {package} 已安装")
+        except ImportError:
+            print(f"正在安装 {package}...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                print(f"✓ {package} 安装成功")
+            except subprocess.CalledProcessError:
+                print(f"✗ {package} 安装失败，请手动安装: pip install {package}")
+                sys.exit(1)
+
+# 安装依赖
+install_required_packages()
 
 def generate_private_key_in_range(start: int, end: int) -> int:
     """在指定范围内生成随机私钥"""
     range_size = end - start
     return start + secrets.randbelow(range_size)
 
-def generate_private_key_with_step(start: int, step: int, counter) -> int:
+def generate_private_key_with_step(start: int, step: int, counter, process_id: int) -> int:
     """使用递增步长生成私钥"""
     with counter.get_lock():
         current = counter.value
         counter.value += step
-    return start + current
+    return start + current + process_id
 
 def private_key_to_wif(private_key: int, compressed: bool = True) -> str:
     """将私钥整数转换为WIF格式"""
@@ -75,100 +97,51 @@ def save_results(results: List[Dict], filename: str = "found_addresses.json"):
     print(f"结果已保存到: {filename}")
 
 def worker_process(process_id: int, 
-                  target_addresses: Set[str],
-                  ranges: List[Tuple[int, int, str]],
-                  found_addresses: Set[str],
-                  results: List[Dict],
+                  target_addresses_set: set,
+                  start_range: int,
+                  end_range: int,
+                  shared_results: list,
                   total_attempts: Value,
                   found_counter: Value,
-                  use_step_method: bool = False,
+                  found_lock: Lock,
+                  use_step_method: bool = True,
                   step_size: int = 1000,
-                  max_attempts_per_range: int = 500000):
+                  max_attempts: int = 500000):
     """工作进程函数"""
     
-    print(f"进程 {process_id} 启动")
+    print(f"进程 {process_id} 启动，搜索范围: {start_range:,} 到 {end_range:,}")
     local_attempts = 0
     local_start_time = time.time()
+    local_found = 0
     
-    for range_idx, (start, end, range_desc) in enumerate(ranges, 1):
-        if len(found_addresses) >= len(target_addresses):
-            break
-            
-        print(f"进程 {process_id} 搜索区间 {range_idx}/{len(ranges)}: {range_desc}")
+    # 使用共享计数器实现递增步长
+    counter = Value('i', 0)
+    
+    while (local_attempts < max_attempts and 
+           found_counter.value < len(target_addresses_set)):
         
-        attempts_in_range = 0
+        local_attempts += 1
+        with total_attempts.get_lock():
+            total_attempts.value += 1
         
+        # 生成私钥
         if use_step_method:
-            # 使用递增步长方法
-            counter = Value('i', process_id)  # 每个进程从不同的起始点开始
-            while (attempts_in_range < max_attempts_per_range and 
-                   len(found_addresses) < len(target_addresses)):
-                
-                attempts_in_range += 1
-                local_attempts += 1
-                with total_attempts.get_lock():
-                    total_attempts.value += 1
-                
-                # 使用递增步长生成私钥
-                private_key_int = generate_private_key_with_step(start, step_size, counter)
-                
-                # 检查是否超出范围
-                if private_key_int >= end:
-                    break
-                
-                # 生成地址
-                address = private_key_to_address(private_key_int)
-                
-                # 检查是否匹配目标地址
-                if address in target_addresses and address not in found_addresses:
-                    wif = private_key_to_wif(private_key_int)
-                    
-                    result = {
-                        "address": address,
-                        "private_key_wif": wif,
-                        "private_key_hex": format(private_key_int, '064x'),
-                        "private_key_decimal": str(private_key_int),
-                        "range": range_desc,
-                        "process_id": process_id,
-                        "attempts_in_range": attempts_in_range,
-                        "total_attempts": total_attempts.value,
-                        "found_time": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                    
-                    results.append(result)
-                    found_addresses.add(address)
-                    with found_counter.get_lock():
-                        found_counter.value += 1
-                    
-                    print(f"🎯 进程 {process_id} 找到匹配地址!")
-                    print(f"   地址: {address}")
-                    print(f"   所在区间: {range_desc}")
-                    print(f"   区间内尝试次数: {attempts_in_range}")
-                    print(f"   总尝试次数: {total_attempts.value}")
-                    print(f"   找到时间: {result['found_time']}")
-                    print("-" * 40)
-                    
-                    # 如果找到所有目标地址，提前结束
-                    if len(found_addresses) >= len(target_addresses):
-                        break
+            private_key_int = generate_private_key_with_step(start_range, step_size, counter, process_id)
+            # 检查是否超出范围
+            if private_key_int >= end_range:
+                break
         else:
-            # 使用随机方法
-            while (attempts_in_range < max_attempts_per_range and 
-                   len(found_addresses) < len(target_addresses)):
-                
-                attempts_in_range += 1
-                local_attempts += 1
-                with total_attempts.get_lock():
-                    total_attempts.value += 1
-                
-                # 生成私钥
-                private_key_int = generate_private_key_in_range(start, end)
-                
-                # 生成地址
-                address = private_key_to_address(private_key_int)
-                
-                # 检查是否匹配目标地址
-                if address in target_addresses and address not in found_addresses:
+            private_key_int = generate_private_key_in_range(start_range, end_range)
+        
+        # 生成地址
+        address = private_key_to_address(private_key_int)
+        
+        # 检查是否匹配目标地址
+        if address in target_addresses_set:
+            with found_lock:
+                # 再次检查防止重复添加
+                already_found = any(r['address'] == address for r in shared_results)
+                if not already_found:
                     wif = private_key_to_wif(private_key_int)
                     
                     result = {
@@ -176,39 +149,44 @@ def worker_process(process_id: int,
                         "private_key_wif": wif,
                         "private_key_hex": format(private_key_int, '064x'),
                         "private_key_decimal": str(private_key_int),
-                        "range": range_desc,
+                        "range": f"2^70 to 2^77 (合并区间)",
                         "process_id": process_id,
-                        "attempts_in_range": attempts_in_range,
+                        "attempts": local_attempts,
                         "total_attempts": total_attempts.value,
                         "found_time": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
                     
-                    results.append(result)
-                    found_addresses.add(address)
+                    shared_results.append(result)
+                    local_found += 1
                     with found_counter.get_lock():
                         found_counter.value += 1
                     
                     print(f"🎯 进程 {process_id} 找到匹配地址!")
                     print(f"   地址: {address}")
-                    print(f"   所在区间: {range_desc}")
-                    print(f"   区间内尝试次数: {attempts_in_range}")
+                    print(f"   进程ID: {process_id}")
+                    print(f"   尝试次数: {local_attempts}")
                     print(f"   总尝试次数: {total_attempts.value}")
                     print(f"   找到时间: {result['found_time']}")
-                    print("-" * 40)
+                    print("-" * 50)
                     
-                    # 如果找到所有目标地址，提前结束
-                    if len(found_addresses) >= len(target_addresses):
-                        break
+                    # 立即保存结果
+                    save_results(list(shared_results))
+            
+            # 如果找到所有目标地址，提前结束
+            if found_counter.value >= len(target_addresses_set):
+                break
         
         # 显示进度
-        if attempts_in_range > 0:
+        if local_attempts % 10000 == 0:
             elapsed_time = time.time() - local_start_time
             rate = local_attempts / elapsed_time if elapsed_time > 0 else 0
-            print(f"进程 {process_id} 区间 {range_idx} 完成: 尝试 {attempts_in_range:,} 次, 速度: {rate:.1f} 次/秒")
+            print(f"进程 {process_id}: 已尝试 {local_attempts:,} 次, 速度: {rate:.1f} 次/秒, 找到 {local_found} 个地址")
     
-    print(f"进程 {process_id} 完成, 总尝试次数: {local_attempts:,}")
+    # 进程完成统计
+    elapsed_time = time.time() - local_start_time
+    print(f"进程 {process_id} 完成: 尝试 {local_attempts:,} 次, 找到 {local_found} 个地址, 平均速度: {local_attempts/elapsed_time:.1f} 次/秒")
 
-def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: bool = False, step_size: int = 1000):
+def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: bool = True, step_size: int = 1000):
     """多进程生成私钥并搜索目标地址"""
     target_addresses = {
         "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU",
@@ -219,22 +197,24 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         "1Bxk4CQdqL9p22JEtDfdXMsng1XacifUtE"
     }
     
-    # 使用Manager创建共享对象
+    # 设置多进程启动方法 [citation:1]
+    try:
+        multiprocessing.set_start_method('fork', force=True)
+    except RuntimeError:
+        pass
+    
+    # 使用Manager创建共享对象 [citation:6]
     with Manager() as manager:
-        shared_found_addresses = manager.set(target_addresses)  # 只读的
+        # 创建共享列表和值
         shared_results = manager.list()
         shared_total_attempts = Value('i', 0)
         shared_found_counter = Value('i', 0)
+        shared_lock = manager.Lock()
         
-        # 创建进程安全的已找到地址集合
-        found_addresses_set = set()
-        
-        # 定义范围
-        ranges = []
-        for i in range(70, 77):
-            start = 2 ** i
-            end = 2 ** (i + 1)
-            ranges.append((start, end, f"2^{i} to 2^{i+1}"))
+        # 合并区间为 2^70 到 2^77
+        start_range = 2 ** 70
+        end_range = 2 ** 77
+        range_desc = f"2^70 to 2^77 (合并区间)"
         
         print("开始多进程搜索目标地址...")
         print("目标地址列表:")
@@ -244,7 +224,8 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         print(f"搜索方法: {'递增步长' if use_step_method else '随机生成'}")
         if use_step_method:
             print(f"步长大小: {step_size}")
-        print(f"搜索范围: {len(ranges)} 个区间")
+        print(f"搜索范围: {range_desc}")
+        print(f"范围大小: {end_range - start_range:,}")
         print("=" * 60)
         
         start_time = time.time()
@@ -257,22 +238,30 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
                 args=(
                     i + 1,
                     target_addresses,
-                    ranges,
-                    found_addresses_set,  # 注意：这个在进程间不会自动同步
+                    start_range,
+                    end_range,
                     shared_results,
                     shared_total_attempts,
                     shared_found_counter,
+                    shared_lock,
                     use_step_method,
                     step_size,
-                    500000 // num_processes  # 每个进程的尝试次数
+                    500000 // num_processes  # 每个进程的最大尝试次数
                 )
             )
             processes.append(p)
             p.start()
         
         # 等待所有进程完成
-        for p in processes:
-            p.join()
+        try:
+            for p in processes:
+                p.join()
+        except KeyboardInterrupt:
+            print("\n接收到中断信号，正在停止所有进程...")
+            for p in processes:
+                p.terminate()
+            for p in processes:
+                p.join()
         
         # 最终统计
         end_time = time.time()
@@ -294,10 +283,10 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
                 print(f"{i}. 地址: {result['address']}")
                 print(f"   私钥(WIF): {result['private_key_wif']}")
                 print(f"   进程ID: {result['process_id']}")
-                print(f"   所在区间: {result['range']}")
+              print(f"   所在区间: {result['range']}")
                 print()
             
-            # 保存结果
+            # 保存最终结果
             save_results(final_results)
         else:
             print("未找到任何目标地址")
@@ -306,14 +295,15 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
 
 def main():
     """主函数"""
-    print("比特币地址多进程搜索工具")
+    print("比特币地址多进程搜索工具 - 腾讯云服务器优化版")
     print("=" * 50)
     print("此工具使用多进程并行搜索，大幅提高搜索效率")
+    print("自动安装依赖库，合并搜索区间，优化性能")
     print("=" * 50)
     
     # 配置参数
     num_processes = 20  # 进程数量
-    use_step_method = True  # 是否使用递增步长方法
+    use_step_method = True  # 使用递增步长方法
     step_size = 1000  # 步长大小
     
     try:
@@ -325,12 +315,15 @@ def main():
         
     except KeyboardInterrupt:
         print("\n程序被用户中断")
+        # 如果已经有结果，保存当前进度
+        if 'results' in locals() and results:
+            save_results(list(results), "interrupted_results.json")
     except Exception as e:
         print(f"发生错误: {e}")
         import traceback
         traceback.print_exc()
+        if 'results' in locals() and results:
+            save_results(list(results), "error_results.json")
 
 if __name__ == "__main__":
-    # 设置多进程启动方法
-    multiprocessing.set_start_method('spawn', force=True)
     main()
