@@ -8,6 +8,7 @@ import time
 import multiprocessing
 import subprocess
 import sys
+import csv
 from typing import List, Tuple, Dict, Set
 from multiprocessing import Process, Manager, Value, Lock
 
@@ -41,7 +42,7 @@ def generate_private_key_with_step(start: int, step: int, counter, process_id: i
     with counter.get_lock():
         current = counter.value
         counter.value += step
-    return start + current + process_id
+    return start + current + (process_id * step)
 
 def private_key_to_wif(private_key: int, compressed: bool = True) -> str:
     """将私钥整数转换为WIF格式"""
@@ -96,23 +97,41 @@ def save_results(results: List[Dict], filename: str = "found_addresses.json"):
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"结果已保存到: {filename}")
 
+def save_all_keys_to_csv(keys_data: List[Dict], filename: str = "all_generated_keys.csv"):
+    """保存所有生成的私钥和地址到CSV文件"""
+    if not keys_data:
+        return
+        
+    fieldnames = ["process_id", "private_key_decimal", "private_key_hex", "private_key_wif", "address", "timestamp"]
+    
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for data in keys_data:
+            writer.writerow(data)
+    
+    print(f"所有生成的密钥已保存到: {filename} (共 {len(keys_data)} 条记录)")
+
 def worker_process(process_id: int, 
                   target_addresses_set: set,
                   start_range: int,
                   end_range: int,
                   shared_results: list,
+                  shared_all_keys: list,
                   total_attempts: Value,
                   found_counter: Value,
                   found_lock: Lock,
                   use_step_method: bool = True,
                   step_size: int = 1000,
-                  max_attempts: int = 500000):
+                  max_attempts: int = 500000,
+                  save_all_keys: bool = True):
     """工作进程函数"""
     
     print(f"进程 {process_id} 启动，搜索范围: {start_range:,} 到 {end_range:,}")
     local_attempts = 0
     local_start_time = time.time()
     local_found = 0
+    local_keys = []  # 本地保存生成的密钥
     
     # 使用共享计数器实现递增步长
     counter = Value('i', 0)
@@ -135,6 +154,24 @@ def worker_process(process_id: int,
         
         # 生成地址
         address = private_key_to_address(private_key_int)
+        
+        # 保存所有生成的密钥（如果启用）
+        if save_all_keys:
+            key_data = {
+                "process_id": process_id,
+                "private_key_decimal": str(private_key_int),
+                "private_key_hex": format(private_key_int, '064x'),
+                "private_key_wif": private_key_to_wif(private_key_int),
+                "address": address,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            local_keys.append(key_data)
+            
+            # 每1000条记录批量保存到共享列表
+            if len(local_keys) >= 1000:
+                with found_lock:
+                    shared_all_keys.extend(local_keys)
+                local_keys = []
         
         # 检查是否匹配目标地址
         if address in target_addresses_set:
@@ -182,11 +219,16 @@ def worker_process(process_id: int,
             rate = local_attempts / elapsed_time if elapsed_time > 0 else 0
             print(f"进程 {process_id}: 已尝试 {local_attempts:,} 次, 速度: {rate:.1f} 次/秒, 找到 {local_found} 个地址")
     
+    # 保存剩余本地密钥
+    if save_all_keys and local_keys:
+        with found_lock:
+            shared_all_keys.extend(local_keys)
+    
     # 进程完成统计
     elapsed_time = time.time() - local_start_time
     print(f"进程 {process_id} 完成: 尝试 {local_attempts:,} 次, 找到 {local_found} 个地址, 平均速度: {local_attempts/elapsed_time:.1f} 次/秒")
 
-def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: bool = True, step_size: int = 1000):
+def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: bool = True, step_size: int = 1000, save_all_keys: bool = True):
     """多进程生成私钥并搜索目标地址"""
     target_addresses = {
         "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU",
@@ -207,6 +249,7 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
     with Manager() as manager:
         # 创建共享列表和值
         shared_results = manager.list()
+        shared_all_keys = manager.list()
         shared_total_attempts = Value('i', 0)
         shared_found_counter = Value('i', 0)
         shared_lock = manager.Lock()
@@ -226,6 +269,7 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
             print(f"步长大小: {step_size}")
         print(f"搜索范围: {range_desc}")
         print(f"范围大小: {end_range - start_range:,}")
+        print(f"保存所有密钥: {'是' if save_all_keys else '否'}")
         print("=" * 60)
         
         start_time = time.time()
@@ -241,12 +285,14 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
                     start_range,
                     end_range,
                     shared_results,
+                    shared_all_keys,
                     shared_total_attempts,
                     shared_found_counter,
                     shared_lock,
                     use_step_method,
                     step_size,
-                    500000 // num_processes  # 每个进程的最大尝试次数
+                    500000 // num_processes,  # 每个进程的最大尝试次数
+                    save_all_keys
                 )
             )
             processes.append(p)
@@ -276,6 +322,7 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         
         # 转换共享结果为普通列表
         final_results = list(shared_results)
+        all_keys_data = list(shared_all_keys)
         
         if len(final_results) > 0:
             print(f"\n找到的地址详情:")
@@ -291,7 +338,11 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         else:
             print("未找到任何目标地址")
         
-        return final_results
+        # 保存所有生成的密钥
+        if save_all_keys and all_keys_data:
+            save_all_keys_to_csv(all_keys_data)
+        
+        return final_results, all_keys_data
 
 def main():
     """主函数"""
@@ -305,12 +356,14 @@ def main():
     num_processes = 20  # 进程数量
     use_step_method = True  # 使用递增步长方法
     step_size = 1000  # 步长大小
+    save_all_keys = True  # 是否保存所有生成的密钥
     
     try:
-        results = generate_and_search_multiprocess(
+        results, all_keys = generate_and_search_multiprocess(
             num_processes=num_processes,
             use_step_method=use_step_method,
-            step_size=step_size
+            step_size=step_size,
+            save_all_keys=save_all_keys
         )
         
     except KeyboardInterrupt:
@@ -318,12 +371,16 @@ def main():
         # 如果已经有结果，保存当前进度
         if 'results' in locals() and results:
             save_results(list(results), "interrupted_results.json")
+        if 'all_keys' in locals() and all_keys:
+            save_all_keys_to_csv(list(all_keys), "interrupted_all_keys.csv")
     except Exception as e:
         print(f"发生错误: {e}")
         import traceback
         traceback.print_exc()
         if 'results' in locals() and results:
             save_results(list(results), "error_results.json")
+        if 'all_keys' in locals() and all_keys:
+            save_all_keys_to_csv(list(all_keys), "error_all_keys.csv")
 
 if __name__ == "__main__":
     main()
