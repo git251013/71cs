@@ -291,7 +291,7 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
                     shared_lock,
                     use_step_method,
                     step_size,
-                    500000 // num_processes,  # 每个进程的最大尝试次数
+                    100000000 // num_processes,  # 每个进程的最大尝试次数
                     save_all_keys
                 )
             )
@@ -355,8 +355,8 @@ def main():
     # 配置参数
     num_processes = 20  # 进程数量
     use_step_method = True  # 使用递增步长方法
-    step_size = 1000  # 步长大小
-    save_all_keys = True  # 是否保存所有生成的密钥
+    step_size = 1024  # 步长大小
+    save_all_keys = False  # 是否保存所有生成的密钥
     
     try:
         results, all_keys = generate_and_search_multiprocess(
