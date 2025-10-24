@@ -4,7 +4,7 @@ import ecdsa
 import base58
 import time
 import multiprocessing
-from multiprocessing import Process, Queue, Manager, Value, Lock
+from multiprocessing import Process, Manager, Value, Lock, Event
 
 # 目标地址列表
 TARGET_ADDRESSES = [
@@ -21,6 +21,31 @@ TARGET_ADDRESSES = [
     "14MdEb4eFcT3MVG5sPFG4jGLuHJSnt1Dk2",
     "1CMq3SvFcVEcpLMuuH8PUcNiqsK1oicG2D"
 ]
+
+def generate_private_key_in_range(start, end):
+    """在指定范围内生成随机私钥"""
+    # 确保范围有效
+    if start >= end:
+        raise ValueError("起始值必须小于结束值")
+    
+    # 比特币私钥的最大值 (secp256k1曲线的阶 - 1)
+    max_private_key = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    
+    # 确保范围不超过比特币允许的最大值
+    end = min(end, max_private_key)
+    if start >= end:
+        start = end - 1
+    
+    # 生成范围内的随机私钥
+    range_size = end - start
+    random_bytes = os.urandom(32)
+    random_int = int.from_bytes(random_bytes, 'big')
+    private_key_int = start + (random_int % range_size)
+    
+    # 确保私钥在有效范围内
+    private_key_int = max(1, min(private_key_int, max_private_key))
+    
+    return format(private_key_int, '064x')
 
 def private_key_to_compressed_public_key(private_key_hex):
     """从私钥生成压缩公钥"""
@@ -115,34 +140,8 @@ def generate_addresses():
         print(f"\n⚠️  在{total_generated}个地址中未找到任何目标地址")
         print("提示：在随机生成中匹配特定地址的概率极低。")
 
-def generate_private_key_in_range(start, end):
-    """在指定范围内生成随机私钥"""
-    # 确保范围有效
-    if start >= end:
-        raise ValueError("起始值必须小于结束值")
-    
-    # 比特币私钥的最大值 (secp256k1曲线的阶 - 1)
-    max_private_key = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    
-    # 确保范围不超过比特币允许的最大值
-    end = min(end, max_private_key)
-    if start >= end:
-        start = end - 1
-    
-    # 生成范围内的随机私钥
-    range_size = end - start
-    random_bytes = os.urandom(32)
-    random_int = int.from_bytes(random_bytes, 'big')
-    private_key_int = start + (random_int % range_size)
-    
-    # 确保私钥在有效范围内
-    private_key_int = max(1, min(private_key_int, max_private_key))
-    
-    return format(private_key_int, '064x')
-
 def worker_process(worker_id, found_addresses, total_generated, lock, stop_event, batch_size=1000):
     """工作进程函数，用于多进程搜索"""
-    batch_count = 0
     local_generated = 0
     
     while not stop_event.is_set():
@@ -159,7 +158,7 @@ def worker_process(worker_id, found_addresses, total_generated, lock, stop_event
             local_generated += 1
             
             # 检查是否匹配任何目标地址
-            if address in TARGET_ADDRESSES and address not in found_addresses:
+            if address in TARGET_ADDRESSES:
                 with lock:
                     if address not in found_addresses:  # 双重检查
                         found_addresses[address] = private_key_hex
@@ -177,7 +176,6 @@ def worker_process(worker_id, found_addresses, total_generated, lock, stop_event
         with lock:
             total_generated.value += local_generated
         
-        batch_count += 1
         local_generated = 0
         
         # 短暂休眠以避免过度占用CPU
@@ -241,17 +239,24 @@ def multi_process_search(num_processes=None):
                 last_count = current_count
                 last_time = current_time
             
+            # 设置停止事件，确保所有进程都停止
+            stop_event.set()
+            
             # 等待所有进程结束
             for p in processes:
-                p.join(timeout=1)
-                
+                p.join(timeout=2)
+                if p.is_alive():
+                    p.terminate()
+                    
         except KeyboardInterrupt:
             print(f"\n\n用户中断搜索")
             stop_event.set()
             
             # 等待进程结束
             for p in processes:
-                p.join(timeout=1)
+                p.join(timeout=2)
+                if p.is_alive():
+                    p.terminate()
         
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -271,165 +276,65 @@ def multi_process_search(num_processes=None):
         else:
             print(f"\n⚠️  未找到任何目标地址")
 
-def display_target_addresses():
-    """显示所有目标地址"""
-    print("目标地址列表:")
-    for i, addr in enumerate(TARGET_ADDRESSES, 1):
-        print(f"{i:2d}. {addr}")
-
-if __name__ == "__main__":
-    # 在Windows上，多进程需要这个保护
-    multiprocessing.freeze_support()
+def single_process_search():
+    """单进程持续搜索"""
+    found_addresses = {}
+    total_generated = 0
+    start_time = time.time()
+    batch_size = 1000
     
-    print("比特币地址生成器")
-    print("=" * 50)
-    display_target_addresses()
-    print("\n选择模式:")
-    print("1. 生成160个在指数范围内的地址")
-    print("2. 单进程持续搜索")
-    print("3. 多进程持续搜索")
-    
-    choice = input("\n请输入选择 (1, 2 或 3): ").strip()
-    
-    if choice == "1":
-        generate_addresses()
-    elif choice == "2":
-        # 单进程搜索
-        found_addresses = {}
-        total_generated = 0
-        start_time = time.time()
-        batch_size = 1000
-        
-        print(f"单进程搜索目标地址: {len(TARGET_ADDRESSES)} 个")
-        print("按Ctrl+C停止搜索")
-        print("-" * 100)
-        
-        try:
-            while len(found_addresses) < len(TARGET_ADDRESSES):
-                batch_start = time.time()
-                
-                for _ in range(batch_size):
-                    # 生成随机私钥
-                    private_key_hex = os.urandom(32).hex()
-                    
-                    # 生成压缩公钥和地址
-                    compressed_public_key = private_key_to_compressed_public_key(private_key_hex)
-                    address = public_key_to_address(compressed_public_key)
-                    
-         local_generated += 1
-            
-            # 检查是否匹配任何目标地址
-            if address in TARGET_ADDRESSES and address not in found_addresses:
-                with lock:
-                    if address not in found_addresses:  # 双重检查
-                        found_addresses[address] = private_key_hex
-                        print(f"\n🎉 进程 {worker_id} 找到新目标地址 ({len(found_addresses)}/{len(TARGET_ADDRESSES)})!")
-                        print(f"私钥: {private_key_hex}")
-                        print(f"地址: {address}")
-                        print("-" * 80)
-                        
-                        # 如果找到所有目标地址，设置停止事件
-                        if len(found_addresses) >= len(TARGET_ADDRESSES):
-                            stop_event.set()
-                            break
-        
-        # 更新总生成计数
-        with lock:
-            total_generated.value += local_generated
-        
-        batch_count += 1
-        local_generated = 0
-        
-        # 短暂休眠以避免过度占用CPU
-        time.sleep(0.01)
-
-def multi_process_search(num_processes=None):
-    """多进程搜索目标地址"""
-    if num_processes is None:
-        num_processes = multiprocessing.cpu_count()
-    
-    print(f"启动 {num_processes} 个进程进行搜索")
-    print(f"目标地址数量: {len(TARGET_ADDRESSES)}")
+    print(f"单进程搜索目标地址: {len(TARGET_ADDRESSES)} 个")
     print("按Ctrl+C停止搜索")
     print("-" * 100)
     
-    # 使用Manager创建共享对象
-    with Manager() as manager:
-        # 共享字典，用于存储找到的地址
-        found_addresses = manager.dict()
-        
-        # 共享值，用于统计总生成数量
-        total_generated = manager.Value('i', 0)
-        
-        # 锁，用于同步对共享资源的访问
-        lock = manager.Lock()
-        
-        # 事件，用于通知所有进程停止
-        stop_event = manager.Event()
-        
-        # 启动工作进程
-        processes = []
-        start_time = time.time()
-        
-        try:
-            for i in range(num_processes):
-                p = Process(target=worker_process, 
-                           args=(i, found_addresses, total_generated, lock, stop_event))
-                p.daemon = True
-                p.start()
-                processes.append(p)
+    try:
+        while len(found_addresses) < len(TARGET_ADDRESSES):
+            batch_start = time.time()
             
-            # 主进程监控进度
-            last_count = 0
-            last_time = start_time
+            for _ in range(batch_size):
+                # 生成随机私钥
+                private_key_hex = os.urandom(32).hex()
+                
+                # 生成压缩公钥和地址
+                compressed_public_key = private_key_to_compressed_public_key(private_key_hex)
+                address = public_key_to_address(compressed_public_key)
+                
+                total_generated += 1
+                
+                # 检查是否匹配任何目标地址
+                if address in TARGET_ADDRESSES and address not in found_addresses:
+                    found_addresses[address] = private_key_hex
+                    print(f"\n🎉 找到新目标地址 ({len(found_addresses)}/{len(TARGET_ADDRESSES)})!")
+                    print(f"私钥: {private_key_hex}")
+                    print(f"地址: {address}")
+                    print("-" * 80)
             
-            while not stop_event.is_set() and len(found_addresses) < len(TARGET_ADDRESSES):
-                time.sleep(1)  # 每秒更新一次进度
-                
-                current_count = total_generated.value
-                current_time = time.time()
-                
-                # 计算速度
-                time_diff = current_time - last_time
-                count_diff = current_count - last_count
-                speed = count_diff / time_diff if time_diff > 0 else 0
-                
-                # 显示进度
-                progress = f"已生成: {current_count} | 找到: {len(found_addresses)}/{len(TARGET_ADDRESSES)} | 速度: {speed:.2f} 地址/秒"
-                print(progress, end='\r')
-                
-                last_count = current_count
-                last_time = current_time
+            batch_time =time.time() - batch_start
+            speed = batch_size / batch_time if batch_time > 0 else 0
             
-            # 等待所有进程结束
-            for p in processes:
-                p.join(timeout=1)
-                
-        except KeyboardInterrupt:
-            print(f"\n\n用户中断搜索")
-            stop_event.set()
+            # 显示进度
+            progress = f"已生成: {total_generated} | 找到: {len(found_addresses)}/{len(TARGET_ADDRESSES)} | 速度: {speed:.2f} 地址/秒"
+            print(progress, end='\r')
             
-            # 等待进程结束
-            for p in processes:
-                p.join(timeout=1)
-        
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        
-        print(f"\n统计信息:")
-        print(f"生成地址总数: {total_generated.value}")
-        print(f"总耗时: {elapsed_time:.2f} 秒")
-        print(f"平均速度: {total_generated.value/elapsed_time:.2f} 地址/秒")
-        print(f"使用进程数: {num_processes}")
-        
-        if found_addresses:
-            print(f"\n🎉 成功找到 {len(found_addresses)} 个目标地址:")
-            for addr, priv_key in found_addresses.items():
-                print(f"地址: {addr}")
-                print(f"私钥: {priv_key}")
-                print("-" * 80)
-        else:
-            print(f"\n⚠️  未找到任何目标地址")
+    except KeyboardInterrupt:
+        print(f"\n\n用户中断搜索")
+    
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    
+    print(f"\n统计信息:")
+    print(f"生成地址总数: {total_generated}")
+    print(f"总耗时: {elapsed_time:.2f} 秒")
+    print(f"平均速度: {total_generated/elapsed_time:.2f} 地址/秒")
+    
+    if found_addresses:
+        print(f"\n🎉 成功找到 {len(found_addresses)} 个目标地址:")
+        for addr, priv_key in found_addresses.items():
+            print(f"地址: {addr}")
+            print(f"私钥: {priv_key}")
+            print("-" * 80)
+    else:
+        print(f"\n⚠️  未找到任何目标地址")
 
 def display_target_addresses():
     """显示所有目标地址"""
@@ -454,69 +359,18 @@ if __name__ == "__main__":
     if choice == "1":
         generate_addresses()
     elif choice == "2":
-        # 单进程搜索
-        found_addresses = {}
-        total_generated = 0
-        start_time = time.time()
-        batch_size = 1000
-        
-        print(f"单进程搜索目标地址: {len(TARGET_ADDRESSES)} 个")
-        print("按Ctrl+C停止搜索")
-        print("-" * 100)
-        
-        try:
-            while len(found_addresses) < len(TARGET_ADDRESSES):
-                batch_start = time.time()
-                
-                for _ in range(batch_size):
-                    # 生成随机私钥
-                    private_key_hex = os.urandom(32).hex()
-                    
-                    # 生成压缩公钥和地址
-                    compressed_public_key = private_key_to_compressed_public_key(private_key_hex)
-                    address = public_key_to_address(compressed_public_key)
-                    
-                    total_generated += 1
-                    
-                    # 检查是否匹配任何目标地址
-                    if address in TARGET_ADDRESSES and address not in found_addresses:
-                        found_addresses[address] = private_key_hex
-                        print(f"\n🎉 找到新目标地址 ({len(found_addresses)}/{len(TARGET_ADDRESSES)})!")
-                        print(f"私钥: {private_key_hex}")
-                        print(f"地址: {address}")
-                        print("-" * 80)
-                
-                batch_time = time.time() - batch_start
-                speed = batch_size / batch_time if batch_time > 0 else 0
-                
-                # 显示进度
-                progress = f"已生成: {total_generated} | 找到: {len(found_addresses)}/{len(TARGET_ADDRESSES)} | 速度: {speed:.2f} 地址/秒"
-                print(progress, end='\r')
-                
-        except KeyboardInterrupt:
-            print(f"\n\n用户中断搜索")
-        
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        
-        print(f"\n统计信息:")
-        print(f"生成地址总数: {total_generated}")
-        print(f"总耗时: {elapsed_time:.2f} 秒")
-        print(f"平均速度: {total_generated/elapsed_time:.2f} 地址/秒")
-        
-        if found_addresses:
-            print(f"\n🎉 成功找到 {len(found_addresses)} 个目标地址:")
-            for addr, priv_key in found_addresses.items():
-                print(f"地址: {addr}")
-                print(f"私钥: {priv_key}")
-                print("-" * 80)
-        else:
-            print(f"\n⚠️  未找到任何目标地址")
+        single_process_search()
     elif choice == "3":
         # 多进程搜索
         try:
-            num_processes = int(input(f"请输入要使用的进程数 (建议 1-{multiprocessing.cpu_count()}): ") or multiprocessing.cpu_count())
-            num_processes = max(1, min(num_processes, multiprocessing.cpu_count() * 2))  # 限制最大进程数
+            cpu_count = multiprocessing.cpu_count()
+            default_processes = min(cpu_count, 8)  # 限制默认进程数
+            user_input = input(f"请输入要使用的进程数 (建议 1-{cpu_count}, 默认{default_processes}): ").strip()
+            if user_input:
+                num_processes = int(user_input)
+                num_processes = max(1, min(num_processes, cpu_count * 2))  # 限制最大进程数
+            else:
+                num_processes = default_processes
             multi_process_search(num_processes)
         except ValueError:
             print("输入无效，使用默认进程数")
