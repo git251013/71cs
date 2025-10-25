@@ -255,8 +255,8 @@ def generate_and_search_multiprocess(num_processes: int = 20, use_step_method: b
         shared_lock = manager.Lock()
         
         # 合并区间为 2^70 到 2^77
-        start_range = 2 ** 70
-        end_range = 2 ** 77
+        start_range = 1912499539311086489992
+        end_range = 1922499539311186489992
         range_desc = f"2^70 to 2^77 (合并区间)"
         
         print("开始多进程搜索目标地址...")
