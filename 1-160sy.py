@@ -4,7 +4,7 @@ import ecdsa
 import base58
 import time
 import multiprocessing
-from multiprocessing import Process, Manager, Value, Lock, Event
+from multiprocessing import Process, Manager, Value, Event
 
 # 目标地址列表
 TARGET_ADDRESSES = [
@@ -140,13 +140,11 @@ def generate_addresses():
         print(f"\n⚠️  在{total_generated}个地址中未找到任何目标地址")
         print("提示：在随机生成中匹配特定地址的概率极低。")
 
-def worker_process(worker_id, found_addresses, total_generated, lock, stop_event, batch_size=1000):
+def worker_process(worker_id, found_addresses, total_generated, stop_event, batch_size=1000):
     """工作进程函数，用于多进程搜索"""
     local_generated = 0
     
     while not stop_event.is_set():
-        batch_start = time.time()
-        
         for _ in range(batch_size):
             # 生成随机私钥
             private_key_hex = os.urandom(32).hex()
@@ -158,24 +156,22 @@ def worker_process(worker_id, found_addresses, total_generated, lock, stop_event
             local_generated += 1
             
             # 检查是否匹配任何目标地址
-            if address in TARGET_ADDRESSES:
-                with lock:
-                    if address not in found_addresses:  # 双重检查
-                        found_addresses[address] = private_key_hex
-                        print(f"\n🎉 进程 {worker_id} 找到新目标地址 ({len(found_addresses)}/{len(TARGET_ADDRESSES)})!")
-                        print(f"私钥: {private_key_hex}")
-                        print(f"地址: {address}")
-                        print("-" * 80)
-                        
-                        # 如果找到所有目标地址，设置停止事件
-                        if len(found_addresses) >= len(TARGET_ADDRESSES):
-                            stop_event.set()
-                            break
+            if address in TARGET_ADDRESSES and address not in found_addresses:
+                # 使用Manager字典的原子操作来避免竞争条件
+                if address not in found_addresses:  # 双重检查
+                    found_addresses[address] = private_key_hex
+                    print(f"\n🎉 进程 {worker_id} 找到新目标地址 ({len(found_addresses)}/{len(TARGET_ADDRESSES)})!")
+                    print(f"私钥: {private_key_hex}")
+                    print(f"地址: {address}")
+                    print("-" * 80)
+                    
+                    # 如果找到所有目标地址，设置停止事件
+                    if len(found_addresses) >= len(TARGET_ADDRESSES):
+                        stop_event.set()
+                        break
         
-        # 更新总生成计数
-        with lock:
-            total_generated.value += local_generated
-        
+        # 更新总生成计数 - 使用原子操作
+        total_generated.value += local_generated
         local_generated = 0
         
         # 短暂休眠以避免过度占用CPU
@@ -199,9 +195,6 @@ def multi_process_search(num_processes=None):
         # 共享值，用于统计总生成数量
         total_generated = manager.Value('i', 0)
         
-        # 锁，用于同步对共享资源的访问
-        lock = manager.Lock()
-        
         # 事件，用于通知所有进程停止
         stop_event = manager.Event()
         
@@ -212,7 +205,7 @@ def multi_process_search(num_processes=None):
         try:
             for i in range(num_processes):
                 p = Process(target=worker_process, 
-                           args=(i, found_addresses, total_generated, lock, stop_event))
+                           args=(i, found_addresses, total_generated, stop_event))
                 p.daemon = True
                 p.start()
                 processes.append(p)
@@ -267,9 +260,11 @@ def multi_process_search(num_processes=None):
         print(f"平均速度: {total_generated.value/elapsed_time:.2f} 地址/秒")
         print(f"使用进程数: {num_processes}")
         
-        if found_addresses:
-            print(f"\n🎉 成功找到 {len(found_addresses)} 个目标地址:")
-            for addr, priv_key in found_addresses.items():
+        # 将Manager字典转换为普通字典以便显示
+        found_dict = dict(found_addresses)
+        if found_dict:
+            print(f"\n🎉 成功找到 {len(found_dict)} 个目标地址:")
+            for addr, priv_key in found_dict.items():
                 print(f"地址: {addr}")
                 print(f"私钥: {priv_key}")
                 print("-" * 80)
@@ -309,7 +304,7 @@ def single_process_search():
                     print(f"地址: {address}")
                     print("-" * 80)
             
-            batch_time =time.time() - batch_start
+            batch_time = time.time() - batch_start
             speed = batch_size / batch_time if batch_time > 0 else 0
             
             # 显示进度
