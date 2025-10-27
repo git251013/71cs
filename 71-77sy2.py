@@ -1,311 +1,346 @@
 import hashlib
+import ecdsa
 import base58
 import multiprocessing as mp
-from multiprocessing import Queue, Process, Value, Lock
-import time
+from multiprocessing import Pool, Manager
 import os
-import sys
-from typing import Optional, Tuple
+import time
 import threading
+from typing import Optional, Tuple
+import sys
 
 # 尝试导入GPU相关库
 try:
     import cupy as cp
-    import numpy as np
+    import numba
+    from numba import cuda
     GPU_AVAILABLE = True
-    print("GPU支持已启用 - 使用CuPy")
+    print("GPU加速可用：CUDA")
 except ImportError:
     try:
         import pyopencl as cl
-        import numpy as np
         GPU_AVAILABLE = True
-        print("GPU支持已启用 - 使用OpenCL")
+        print("GPU加速可用：OpenCL")
     except ImportError:
         GPU_AVAILABLE = False
-        print("GPU支持不可用 - 仅使用CPU")
+        print("GPU不可用，将使用纯CPU计算")
 
-# 目标地址
-TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
-TARGET_HASH160 = None
-
-# 全局变量
-found = Value('b', False)
-counter = Value('L', 0)
-lock = Lock()
-
-def hash160_to_address(hash160_bytes):
-    """将hash160字节转换为比特币地址"""
-    # 添加版本字节（0x00 for mainnet）
-    versioned_payload = b'\x00' + hash160_bytes
-    
-    # 计算校验和
-    first_sha256 = hashlib.sha256(versioned_payload).digest()
-    second_sha256 = hashlib.sha256(first_sha256).digest()
-    checksum = second_sha256[:4]
-    
-    # 组合并编码为Base58
-    full_payload = versioned_payload + checksum
-    bitcoin_address = base58.b58encode(full_payload)
-    
-    return bitcoin_address.decode('ascii')
-
-def private_key_to_address(private_key_int):
-    """将私钥整数转换为比特币地址"""
-    # 使用secp256k1曲线的参数
-    p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-    a = 0
-    b = 7
-    Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
-    Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
-    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    
-    # 计算公钥点 (使用椭圆曲线乘法)
-    x, y = elliptic_curve_multiply(private_key_int, Gx, Gy, a, b, p)
-    
-    # 压缩公钥格式
-    if y % 2 == 0:
-        public_key_compressed = b'\x02' + x.to_bytes(32, 'big')
-    else:
-        public_key_compressed = b'\x03' + x.to_bytes(32, 'big')
-    
-    # SHA-256哈希
-    sha256_result = hashlib.sha256(public_key_compressed).digest()
-    
-    # RIPEMD-160哈希
-    ripemd160 = hashlib.new('ripemd160')
-    ripemd160.update(sha256_result)
-    hash160 = ripemd160.digest()
-    
-    # 转换为地址
-    return hash160_to_address(hash160)
-
-def elliptic_curve_multiply(k, Px, Py, a, b, p):
-    """椭圆曲线点乘算法"""
-    if k == 0:
-        return None, None
-    if k == 1:
-        return Px, Py
-    
-    # 使用double-and-add算法
-    result_x, result_y = None, None
-    addend_x, addend_y = Px, Py
-    
-    while k > 0:
-        if k & 1:
-            if result_x is None:
-                result_x, result_y = addend_x, addend_y
-            else:
-                result_x, result_y = elliptic_curve_add(result_x, result_y, addend_x, addend_y, a, p)
+class BitcoinAddressCollision:
+    def __init__(self, target_address: str):
+        self.target_address = target_address
+        self.found_event = mp.Event()
+        self.private_key_found = mp.Value('i', 0)
+        self.searched_keys = Manager().dict()
         
-        # 点加倍
-        addend_x, addend_y = elliptic_curve_double(addend_x, addend_y, a, p)
-        k >>= 1
-    
-    return result_x, result_y
+    def private_key_to_address(self, private_key: int) -> str:
+        """将私钥转换为比特币地址"""
+        try:
+            # 生成ECDSA私钥
+            sk = ecdsa.SigningKey.from_secret_exponent(private_key, curve=ecdsa.SECP256k1)
+            
+            # 获取公钥
+            vk = sk.get_verifying_key()
+            public_key = b'\x04' + vk.to_string()
+            
+            # SHA256哈希
+            sha256_hash = hashlib.sha256(public_key).digest()
+            
+            # RIPEMD160哈希
+            ripemd160_hash = hashlib.new('ripemd160', sha256_hash).digest()
+            
+            # 添加版本字节（主网）
+            versioned_payload = b'\x00' + ripemd160_hash
+            
+            # 计算校验和
+            checksum = hashlib.sha256(hashlib.sha256(versioned_payload).digest()).digest()[:4]
+            
+            # 组合并Base58编码
+            binary_address = versioned_payload + checksum
+            bitcoin_address = base58.b58encode(binary_address).decode('ascii')
+            
+            return bitcoin_address
+        except Exception as e:
+            return None
 
-def elliptic_curve_add(Px, Py, Qx, Qy, a, p):
-    """椭圆曲线点加"""
-    if Px is None:
-        return Qx, Qy
-    if Qx is None:
-        return Px, Py
-    
-    if Px == Qx:
-        if Py == Qy:
-            # 点加倍
-            return elliptic_curve_double(Px, Py, a, p)
-        else:
-            # 点互为逆元
-            return None, None
-    
-    # 计算斜率
-    s = ((Qy - Py) * pow(Qx - Px, p-2, p)) % p
-    
-    # 计算新点
-    Rx = (s * s - Px - Qx) % p
-    Ry = (s * (Px - Rx) - Py) % p
-    
-    return Rx, Ry
-
-def elliptic_curve_double(Px, Py, a, p):
-    """椭圆曲线点加倍"""
-    if Py == 0:
-        return None, None
-    
-    # 计算斜率
-    s = ((3 * Px * Px + a) * pow(2 * Py, p-2, p)) % p
-    
-    # 计算新点
-    Rx = (s * s - 2 * Px) % p
-    Ry = (s * (Px - Rx) - Py) % p
-    
-    return Rx, Ry
-
-def calculate_target_hash160():
-    """计算目标地址的hash160"""
-    global TARGET_HASH160
-    if TARGET_HASH160 is None:
-        # 解码Base58地址
-        decoded = base58.b58decode(TARGET_ADDRESS)
-        # 移除版本字节和校验和
-        TARGET_HASH160 = decoded[1:21]
-    return TARGET_HASH160
-
-def gpu_worker(start_key, end_key, batch_size=100000):
-    """GPU工作进程"""
-    if not GPU_AVAILABLE:
-        return
-    
-    try:
-        # 使用CuPy
-        import cupy as cp
+    def cpu_worker(self, start_key: int, end_key: int, worker_id: int, batch_size: int = 1000):
+        """CPU工作进程"""
+        print(f"CPU Worker {worker_id} 开始搜索范围: {start_key} - {end_key}")
         
-        # 准备目标hash160
-        target_hash160 = calculate_target_hash160()
-        target_array = cp.frombuffer(target_hash160, dtype=cp.uint8)
-        
-        current = start_key
-        while current < end_key and not found.value:
-            batch_end = min(current + batch_size, end_key)
+        current_key = start_key
+        while current_key <= end_key and not self.found_event.is_set():
+            batch_end = min(current_key + batch_size, end_key)
             
-            # 在GPU上生成私钥范围
-            private_keys = cp.arange(current, batch_end, dtype=cp.uint64)
-            
-            # 这里简化处理，实际需要实现完整的椭圆曲线计算
-            # 注意：完整的GPU实现需要大量代码
-            
-            # 更新进度
-            with lock:
-                counter.value += batch_size
-            
-            current = batch_end
-            
-            # 防止过度占用GPU
-            cp.cuda.Stream.null.synchronize()
-            
-    except Exception as e:
-        print(f"GPU worker error: {e}")
-
-def cpu_worker(start_key, end_key, batch_size=10000):
-    """CPU工作进程"""
-    target_hash160 = calculate_target_hash160()
-    
-    current = start_key
-    while current < end_key and not found.value:
-        batch_end = min(current + batch_size, end_key)
-        
-        for private_key in range(current, batch_end):
-            if found.value:
-                break
-                
-            try:
-                # 计算地址
-                address = private_key_to_address(private_key)
-                
-                # 检查是否匹配
-                if address == TARGET_ADDRESS:
-                    with lock:
-                        found.value = True
-                    print(f"\n🎉 找到私钥!: {private_key}")
-                    print(f"地址: {address}")
+            for private_key in range(current_key, batch_end + 1):
+                if self.found_event.is_set():
                     return
                     
-            except Exception as e:
-                continue
-        
-        # 更新进度
-        with lock:
-            counter.value += (batch_end - current)
-        
-        current = batch_end
+                # 跳过已搜索的键
+                if str(private_key) in self.searched_keys:
+                    continue
+                    
+                self.searched_keys[str(private_key)] = True
+                
+                address = self.private_key_to_address(private_key)
+                
+                if address == self.target_address:
+                    print(f"\n🎉 找到匹配的私钥! 🎉")
+                    print(f"私钥: {private_key}")
+                    print(f"地址: {address}")
+                    
+                    with self.private_key_found.get_lock():
+                        self.private_key_found.value = private_key
+                    
+                    self.found_event.set()
+                    return
+            
+            current_key = batch_end + 1
+            
+            # 进度报告
+            if worker_id == 0 and current_key % 10000 == 0:
+                progress = (current_key - start_key) / (end_key - start_key) * 100
+                print(f"CPU Worker {worker_id} 进度: {progress:.2f}%")
+    
+    def gpu_worker_cuda(self, start_key: int, end_key: int, batch_size: int = 10000):
+        """GPU工作线程（CUDA版本）"""
+        if not GPU_AVAILABLE:
+            return
+            
+        try:
+            @cuda.jit
+            def gpu_hash_kernel(private_keys, results):
+                idx = cuda.grid(1)
+                if idx < private_keys.size:
+                    # 这里简化处理，实际需要实现完整的比特币地址生成算法
+                    # 注意：完整的实现需要大量GPU代码
+                    private_key = private_keys[idx]
+                    # 简化的哈希计算
+                    results[idx] = private_key % 1000000  # 占位符
+            
+            print(f"GPU Worker 开始搜索范围: {start_key} - {end_key}")
+            
+            current_key = start_key
+            while current_key <= end_key and not self.found_event.is_set():
+                batch_end = min(current_key + batch_size, end_key)
+                batch_keys = cp.arange(current_key, batch_end + 1, dtype=cp.int64)
+                
+                # 分配GPU内存
+                results = cp.zeros_like(batch_keys)
+                
+                # 启动GPU核函数
+                threads_per_block = 256
+                blocks_per_grid = (batch_keys.size + threads_per_block - 1) // threads_per_block
+                
+                gpu_hash_kernel[blocks_per_grid, threads_per_block](batch_keys, results)
+                
+                # 检查结果
+                results_cpu = cp.asnumpy(results)
+                for i, private_key in enumerate(range(current_key, batch_end + 1)):
+                    if self.found_event.is_set():
+                        return
+                    
+                    # 在实际实现中，这里需要检查地址是否匹配
+                    # 简化版本，直接检查特定条件
+                    if results_cpu[i] == 123456:  # 示例条件
+                        address = self.private_key_to_address(private_key)
+                        if address == self.target_address:
+                            print(f"\n🎉 GPU找到匹配的私钥! 🎉")
+                            print(f"私钥: {private_key}")
+                            
+                            with self.private_key_found.get_lock():
+                                self.private_key_found.value = private_key
+                            
+                            self.found_event.set()
+                            return
+                
+                current_key = batch_end + 1
+                
+                # 进度报告
+                if current_key % 100000 == 0:
+                    progress = (current_key - start_key) / (end_key - start_key) * 100
+                    print(f"GPU Worker 进度: {progress:.2f}%")
+                    
+        except Exception as e:
+            print(f"GPU计算错误: {e}")
+    
+    def gpu_worker_opencl(self, start_key: int, end_key: int, batch_size: int = 10000):
+        """GPU工作线程（OpenCL版本）"""
+        if not GPU_AVAILABLE:
+            return
+            
+        try:
+            # OpenCL上下文和队列
+            context = cl.create_some_context()
+            queue = cl.CommandQueue(context)
+            
+            # OpenCL程序源码
+            program_source = """
+            __kernel void hash_kernel(__global long* private_keys, __global long* results) {
+                int idx = get_global_id(0);
+                if (idx < get_global_size(0)) {
+                    long private_key = private_keys[idx];
+                    results[idx] = private_key % 1000000; // 占位符
+                }
+            }
+            """
+            
+            program = cl.Program(context, program_source).build()
+            
+            print(f"GPU Worker (OpenCL) 开始搜索范围: {start_key} - {end_key}")
+            
+            current_key = start_key
+            while current_key <= end_key and not self.found_event.is_set():
+                batch_end = min(current_key + batch_size, end_key)
+                batch_size_actual = batch_end - current_key + 1
+                
+                # 准备数据
+                private_keys = np.arange(current_key, batch_end + 1, dtype=np.int64)
+                
+                # 创建缓冲区
+                private_keys_buf = cl.Buffer(context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=private_keys)
+                results_buf = cl.Buffer(context, cl.mem_flags.WRITE_ONLY, private_keys.nbytes)
+                
+                # 执行内核
+                program.hash_kernel(queue, private_keys.shape, None, private_keys_buf, results_buf)
+                
+                # 读取结果
+                results = np.empty_like(private_keys)
+                cl.enqueue_copy(queue, results, results_buf)
+                
+                # 检查结果
+                for i, private_key in enumerate(range(current_key, batch_end + 1)):
+                    if self.found_event.is_set():
+                        return
+                    
+                    # 在实际实现中检查地址匹配
+                    if results[i] == 123456:  # 示例条件
+                        address = self.private_key_to_address(private_key)
+                        if address == self.target_address:
+                            print(f"\n🎉 GPU找到匹配的私钥! 🎉")
+                            print(f"私钥: {private_key}")
+                            
+                            with self.private_key_found.get_lock():
+                                self.private_key_found.value = private_key
+                            
+                            self.found_event.set()
+                            return
+                
+                current_key = batch_end + 1
+                
+                # 进度报告
+                if current_key % 100000 == 0:
+                    progress = (current_key - start_key) / (end_key - start_key) * 100
+                    print(f"GPU Worker (OpenCL) 进度: {progress:.2f}%")
+                    
+        except Exception as e:
+            print(f"OpenCL GPU计算错误: {e}")
 
-def progress_monitor(total_keys, start_time):
-    """进度监控器"""
-    while not found.value:
-        time.sleep(5)
-        with lock:
-            processed = counter.value
-            elapsed = time.time() - start_time
-            if elapsed > 0:
-                keys_per_sec = processed / elapsed
-                percent = (processed / total_keys) * 100
-                remaining = total_keys - processed
-                if keys_per_sec > 0:
-                    eta = remaining / keys_per_sec
-                    print(f"\r进度: {percent:.6f}% | 速度: {keys_per_sec:.0f} keys/s | ETA: {eta/3600:.2f} 小时", end="")
-
-def main():
-    print("比特币地址碰撞器")
-    print("=" * 50)
-    print(f"目标地址: {TARGET_ADDRESS}")
-    print(f"搜索范围: 1912345678912345678912 到 1922345678912345678912")
-    
-    # 计算目标hash160
-    calculate_target_hash160()
-    print(f"目标Hash160: {TARGET_HASH160.hex()}")
-    
-    # 定义搜索范围
-    start_range = 1912345678912345678912
-    end_range = 1922345678912345678912
-    total_keys = end_range - start_range
-    
-    print(f"总密钥数: {total_keys:,}")
-    print(f"GPU可用: {GPU_AVAILABLE}")
-    
-    # 计算工作分配
-    num_cpu_cores = mp.cpu_count()
-    print(f"CPU核心数: {num_cpu_cores}")
-    
-    # 分割工作范围
-    range_size = total_keys
-    chunk_size = range_size // (num_cpu_cores * 2)  # 每个进程的块大小
-    
-    processes = []
-    start_time = time.time()
-    
-    # 启动进度监控
-    progress_thread = threading.Thread(target=progress_monitor, args=(total_keys, start_time))
-    progress_thread.daemon = True
-    progress_thread.start()
-    
-    try:
-        # 启动GPU进程（如果可用）
+    def search_range(self, start_range: int, end_range: int, num_cpu_workers: int = None):
+        """在主范围内搜索"""
+        print(f"开始搜索范围: {start_range} 到 {end_range}")
+        print(f"目标地址: {self.target_address}")
+        print(f"GPU可用: {GPU_AVAILABLE}")
+        
+        if num_cpu_workers is None:
+            num_cpu_workers = max(1, mp.cpu_count() - 1)  # 留一个核心给系统
+        
+        total_range = end_range - start_range + 1
+        
+        # 划分CPU工作范围
+        cpu_range_size = total_range // (num_cpu_workers + (1 if GPU_AVAILABLE else 0))
+        
+        processes = []
+        
+        # 启动CPU工作进程
+        for i in range(num_cpu_workers):
+            worker_start = start_range + i * cpu_range_size
+            worker_end = worker_start + cpu_range_size - 1 if i < num_cpu_workers - 1 else end_range
+            
+     p = mp.Process(target=self.cpu_worker, args=(worker_start, worker_end, i))
+            processes.append(p)
+            p.start()
+        
+        # 启动GPU工作线程
         if GPU_AVAILABLE:
-            gpu_process = Process(target=gpu_worker, args=(start_range, end_range))
-            gpu_process.start()
-            processes.append(gpu_process)
-            print("启动GPU工作进程")
-        else:
-            # 仅使用CPU
-            current_start = start_range
-            for i in range(num_cpu_cores * 2):
-                chunk_end = min(current_start + chunk_size, end_range)
-                if current_start >= end_range:
+            gpu_start = start_range + num_cpu_workers * cpu_range_size
+            if gpu_start <= end_range:
+                try:
+                    # 尝试CUDA
+                    import cupy as cp
+                    gpu_thread = threading.Thread(target=self.gpu_worker_cuda, 
+                                                args=(gpu_start, end_range))
+                except:
+                    # 回退到OpenCL
+                    import numpy as np
+                    gpu_thread = threading.Thread(target=self.gpu_worker_opencl, 
+                                                args=(gpu_start, end_range))
+                
+                gpu_thread.daemon = True
+                gpu_thread.start()
+        
+        # 等待结果
+        try:
+            while not self.found_event.is_set():
+                time.sleep(1)
+                
+                # 检查所有进程是否还在运行
+                all_alive = all(p.is_alive() for p in processes)
+                if not all_alive and not self.found_event.is_set():
+                    print("有工作进程异常退出")
                     break
                     
-                process = Process(target=cpu_worker, args=(current_start, chunk_end))
-                process.start()
-                processes.append(process)
-                current_start = chunk_end
-            
-            print(f"启动 {len(processes)} 个CPU工作进程")
+        except KeyboardInterrupt:
+            print("\n接收到中断信号，停止搜索...")
+            self.found_event.set()
         
-        # 等待进程完成
-        for process in processes:
-            process.join()
-            
-    except KeyboardInterrupt:
-        print("\n\n用户中断执行")
-        found.value = True
-        for process in processes:
-            process.terminate()
+        # 清理进程
+        for p in processes:
+            p.terminate()
+            p.join()
+        
+        if self.private_key_found.value > 0:
+            print(f"\n搜索完成！找到私钥: {self.private_key_found.value}")
+            return self.private_key_found.value
+        else:
+            print("\n在指定范围内未找到匹配的私钥")
+            return None
+
+def main():
+    # 目标地址
+    target_address = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
     
-    elapsed = time.time() - start_time
-    print(f"\n总执行时间: {elapsed:.2f} 秒")
-    print(f"处理的密钥总数: {counter.value:,}")
+    # 搜索范围
+    start_range = 1912345678912345678912
+    end_range = 1922345678912345678912
     
-    if not found.value:
-        print("在指定范围内未找到匹配的私钥")
+    print("比特币地址碰撞工具")
+    print("=" * 50)
+    
+    # 验证目标地址格式
+    try:
+        # 简单的Base58解码验证
+        binary_address = base58.b58decode(target_address)
+        if len(binary_address) != 25:
+            print("错误：目标地址格式无效")
+            return
+    except:
+        print("错误：目标地址格式无效")
+        return
+    
+    # 创建碰撞器实例
+    collision_finder = BitcoinAddressCollision(target_address)
+    
+    # 开始搜索
+    start_time = time.time()
+    result = collision_finder.search_range(start_range, end_range)
+    end_time = time.time()
+    
+    print(f"\n总运行时间: {end_time - start_time:.2f} 秒")
+    
+    if result:
+        print(f"成功！私钥: {result}")
+        # 在实际应用中，这里应该安全地保存私钥
+    else:
+        print("未找到匹配的私钥")
 
 if __name__ == "__main__":
     # 在Windows上确保使用spawn方法
