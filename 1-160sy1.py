@@ -372,7 +372,7 @@ if __name__ == "__main__":
         # 多进程搜索
         try:
             cpu_count = multiprocessing.cpu_count()
-            default_processes = min(cpu_count, 8)  # 限制默认进程数
+            default_processes = min(cpu_count, 120)  # 限制默认进程数120
             user_input = input(f"请输入要使用的进程数 (建议 1-{cpu_count}, 默认{default_processes}): ").strip()
             if user_input:
                 num_processes = int(user_input)
