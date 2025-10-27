@@ -353,9 +353,9 @@ def main():
     print("=" * 50)
     
     # 配置参数
-    num_processes = 28  # 进程数量
+    num_processes = 120  # 进程数量120
     use_step_method = True  # 使用递增步长方法
-    step_size = 1  # 步长大小
+    step_size = 1024  # 步长大小
     save_all_keys = False  # 是否保存所有生成的密钥
     
     try:
