@@ -40,8 +40,8 @@ except ImportError as e:
 TARGET_ADDRESS = "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"
 
 # 搜索范围 (2^70.6999 到 2^70.9999)
-START_EXPONENT = 70.6999
-END_EXPONENT = 70.9999
+START_EXPONENT = 70.688888888888
+END_EXPONENT = 70.688888888889
 
 # 计算实际的搜索范围
 START_RANGE = int(2 ** START_EXPONENT)
@@ -212,7 +212,7 @@ def main():
     save_results = save_choice in ['y', 'yes', '1']
     
     # 设置进程数
-    num_processes = min(mp.cpu_count(), 16)  # 最多16个进程
+    num_processes = min(mp.cpu_count(), 120)  # 最多120个进程
     print(f"使用 {num_processes} 个进程进行搜索")
     
     # 创建共享变量
